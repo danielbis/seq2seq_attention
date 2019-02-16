@@ -18,6 +18,8 @@ import random
 import sconce
 import socket
 hostname = socket.gethostname()
+import gensim
+from clean_data import * 
 
 
 # In[3]:
@@ -35,7 +37,7 @@ import numpy as np
 get_ipython().run_line_magic('matplotlib', 'inline')
 
 
-# In[31]:
+# In[4]:
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -49,12 +51,20 @@ else:
 # In[5]:
 
 
-PAD_token = 0
-SOS_token = 1
-EOS_token = 2
+gensim_w2v = gensim.models.KeyedVectors.load_word2vec_format('./wikipedia-pubmed-and-PMC-w2v.bin', binary=True)
 
 
 # In[6]:
+
+
+PAD_token = 0
+SOS_token = 1
+EOS_token = 2
+EMBEDDING_SIZE = 200
+added_count = 0
+
+
+# In[7]:
 
 
 # Source: https://pytorch.org/tutorials/intermediate/seq2seq_translation_tutorial.html
@@ -113,7 +123,7 @@ class Lang:
             self.addWord(word)
 
 
-# In[7]:
+# In[8]:
 
 
 # Turn a Unicode string to plain ASCII, thanks to
@@ -126,13 +136,23 @@ def unicodeToAscii(s):
 
 # Lowercase, trim, and remove non-letter characters
 def normalizeString(s):
-    #s = unicodeToAscii(s.lower().strip())
+    s = s.lower().strip()
+    s = clean_contractions(s)
+    s = clean_special_chars(s)
+    s = correct_spelling(s)
     s = re.sub(r"([.!?])", r" \1", s)
-    #s = re.sub(r"[^a-zA-Z.!?]+", r" ", s)
+    s = re.sub(r"[^a-zA-Z.!?]+", r" ", s)
+  
     return s
 
+def add_lower(vocab):
+    for word in vocab:
+        if word in gensim_w2v and word.lower() not in gensim_w2v:  
+            gensim_w2v[word.lower()] = gensim_w2v[word]
+            added_count += 1
 
-# In[8]:
+
+# In[9]:
 
 
 MAX_LENGTH = 100
@@ -142,6 +162,12 @@ def readLangs(lang1, lang2, reverse=False, equal=False):
 
     # Read the file and split into lines
     lines = open('data/%s_%s.txt' % (lang1, lang2)).        read().strip().split('\n')
+    
+    print("Adding lower case embeddings... ")
+    for l in lines:
+        for s in l.split('\t'):
+            add_lower(s)
+    print("Added %d words to the embedding matrix." % added_count)
 
     # Split every line into pairs and normalize
     pairs = [[normalizeString(s) for s in l.split('\t')] for l in lines]
@@ -160,7 +186,7 @@ def readLangs(lang1, lang2, reverse=False, equal=False):
     return input_lang, output_lang, pairs
 
 
-# In[9]:
+# In[10]:
 
 
 # Filter for q/a with at least MIN_LENGTH chars
@@ -173,11 +199,11 @@ def filterPairs(pairs):
     for i, pair in enumerate(pairs):
         p1 = pair[0].split(' ')
         p1 = " ".join(p1[:MAX_LENGTH])
-        #p2 = pair[1].split(' ')
-        #p2 = " ".join(p2[:MAX_LENGTH])
-        pairs[i] = [p1, pair[1]]
+        p2 = pair[1].split(' ')
+        p2 = " ".join(p2[:MAX_LENGTH])
+        pairs[i] = [p1, p2]
     p = [pair for pair in pairs if filterPair(pair)]
-    return p[:10000] 
+    return p
 
     #return [pair for pair in pairs if filterPair(pair)]
     #return p
@@ -201,7 +227,8 @@ def patch_oov(pairs):
     return unk_patched
 
 
-# In[10]:
+
+# In[11]:
 
 
 def prepareData(lang1, lang2, reverse=False):
@@ -222,7 +249,27 @@ def prepareData(lang1, lang2, reverse=False):
     return input_lang, output_lang, pairs
 
 
-# In[11]:
+# In[12]:
+
+
+def create_embeddings(embedding_matrix, target_lang, gensim_keyed):
+    #0-2 for pad, sos, eos
+    embedding_matrix[0] = embedding_matrix[1] = embedding_matrix[2] = torch.ones(EMBEDDING_SIZE)
+    words_found = 0
+    words_missing = []
+    for i in range(3,target_lang.n_words):
+        try:
+            embedding_matrix[i] = torch.from_numpy(gensim_keyed[target_lang.index2word[i]])
+            words_found += 1
+        except KeyError as ke:
+            embedding_matrix[i] = torch.rand(200)
+            words_missing.append(target_lang.index2word[i])
+            
+    print("words found: %d out of %d in vocab, difference is %d "           % (words_found, target_lang.n_words, (words_found-target_lang.n_words)))
+    return torch.FloatTensor(embedding_matrix)
+
+
+# In[13]:
 
 
 MIN_COUNT = 2
@@ -234,7 +281,19 @@ pairs = patch_oov(pairs)
 print(random.choice(pairs))
 
 
-# In[12]:
+# In[14]:
+
+
+# embedding matrix
+embeddings_matrix = torch.zeros(input_lang.n_words, EMBEDDING_SIZE)
+embeddings_matrix = create_embeddings(embeddings_matrix, input_lang, gensim_w2v)
+print(embeddings_matrix.size())
+print(embeddings_matrix[0])
+
+print(embeddings_matrix[4])
+
+
+# In[15]:
 
 
 # Helpers -- Prepare data for training
@@ -258,7 +317,7 @@ def tensorsFromPair(pair):
     return (input_tensor, target_tensor)
 
 
-# In[13]:
+# In[16]:
 
 
 # Batching 
@@ -293,17 +352,17 @@ def get_batch(batch_size):
     return input_var, input_lengths, target_var, target_lengths
 
 
-# In[14]:
+# In[17]:
 
 
 # Encoder (LSTM)
 
 
-# In[15]:
+# In[18]:
 
 
 class EncoderRNN(nn.Module):
-    def __init__(self, input_size, hidden_size,
+    def __init__(self, input_size, hidden_size,pre_trained_embeddings,
                  n_layers=1, bidirectional=False, dropout=0.1):
         super(EncoderRNN, self).__init__()
         
@@ -316,6 +375,7 @@ class EncoderRNN(nn.Module):
         #self.batch_size = batch_size
 
         self.embedding = nn.Embedding(input_size, hidden_size)
+        self.embedding.weight = torch.nn.Parameter(pre_trained_embeddings)
 
         self.lstm = nn.LSTM(hidden_size, hidden_size, self.n_layers, bidirectional=bidirectional)
 
@@ -335,7 +395,7 @@ class EncoderRNN(nn.Module):
         return Variable(torch.zeros(self.n_layers, 1, self.hidden_size))
 
 
-# In[59]:
+# In[19]:
 
 
 # Attention class, different options
@@ -388,32 +448,35 @@ class Attn(nn.Module):
             return energy
 
 
-# In[60]:
+# In[20]:
 
 
 # Decoder
 
 
-# In[61]:
+# In[21]:
 
 
 class AttnDecoderRNN(nn.Module):
-    def __init__(self, attn_model, hidden_size, output_size, n_layers=1, dropout=0.1):
+    def __init__(self, attn_model, hidden_size, output_size, pre_trained_embeddings, n_layers=1, dropout=0.1):
         super(AttnDecoderRNN, self).__init__()
         
         # Parameters
+        # 2 * encoder_hidden_size
         self.hidden_size = hidden_size
         self.output_size = output_size
         self.dropout = dropout
         self.n_layers = n_layers
         
         # Layers
-        self.embedding = nn.Embedding(self.output_size, self.hidden_size)
+        self.embedding = nn.Embedding(self.output_size, EMBEDDING_SIZE)
+        #self.embedding.weight = torch.nn.Parameter(pre_trained_embeddings)
+
         self.dropout = nn.Dropout(self.dropout)
         self.attn_model = attn_model
         #self.attn = nn.Linear(self.hidden_size * 2, self.max_length)
         self.concat = nn.Linear(self.hidden_size*2, self.hidden_size)
-        self.lstm = nn.LSTM(self.hidden_size, self.hidden_size, self.n_layers)
+        self.lstm = nn.LSTM(EMBEDDING_SIZE, self.hidden_size, self.n_layers)
         self.out = nn.Linear(self.hidden_size, output_size)
         
         # Choose attention model
@@ -424,7 +487,7 @@ class AttnDecoderRNN(nn.Module):
         # Run this one-step at a time
         batch_size = input_seq.size(0)
         embedded = self.embedding(input_seq)
-        embedded = embedded.view(1, batch_size, self.hidden_size) # S=1 x B x N
+        embedded = embedded.view(1, batch_size, EMBEDDING_SIZE) # S=1 x B x N
         embedded = self.dropout(embedded)
 
 
@@ -434,7 +497,7 @@ class AttnDecoderRNN(nn.Module):
         attn_weights = self.attn(rnn_output, encoder_outputs)
 
         context = attn_weights.bmm(encoder_outputs.transpose(0, 1))  # B x S=1 x N
-        
+        #print("Context size: ", context.size())
         # Final output layer (next word prediction) using the RNN hidden state and context vector
         rnn_output = rnn_output.squeeze(0) # S=1 x B x N -> B x N
         context = context.squeeze(1)       # B x S=1 x N -> B x N
@@ -449,7 +512,7 @@ class AttnDecoderRNN(nn.Module):
         return output, context, hidden, attn_weights
 
 
-# In[62]:
+# In[22]:
 
 
 """
@@ -481,7 +544,7 @@ for i in range(3):
     decoder_attns[0, i] = decoder_attn.squeeze(0).data"""
 
 
-# In[63]:
+# In[23]:
 
 
 # Functions to monitor training
@@ -503,107 +566,37 @@ def time_since(since, percent):
     return '%s (- %s)' % (asMinutes(s), asMinutes(rs))
 
 
-# In[54]:
-
-
-# Test 
-small_batch_size = 4
-input_batches, input_lengths, target_batches, target_lengths = get_batch(small_batch_size)
-
-print('input_batches', input_batches.size()) # (max_len x batch_size)
-print('target_batches', target_batches.size()) # (max_len x batch_size)
-
-
-# # Test training loop below
-# 
-
-# In[55]:
-
-
-small_hidden_size = 16
-small_n_layers = 4
-
-encoder_test = EncoderRNN(input_lang.n_words, small_hidden_size, small_n_layers, bidirectional=True)
-decoder_test = AttnDecoderRNN('concat', 2*small_hidden_size, output_lang.n_words, small_n_layers)
-
-if USE_CUDA:
-    encoder_test.cuda()
-    decoder_test.cuda()
-
-
-# In[56]:
-
-
-encoder_outputs, encoder_hidden = encoder_test(input_batches, input_lengths, None)
-
-print('encoder_outputs', encoder_outputs.size()) # max_len x batch_size x hidden_size
-print('encoder_hidden', encoder_hidden[0].size()) # n_layers * 2 x batch_size x hidden_size
-
-
-# In[57]:
-
-
-max_target_length = max(target_lengths)
-
-# Prepare decoder input and outputs
-decoder_input = Variable(torch.LongTensor([SOS_token] * small_batch_size))
-decoder_hidden = encoder_hidden[:decoder_test.n_layers]  # Use last (forward) hidden state from encoder
-#decoder_hidden = torch.cat((decoder_hidden, decoder_hidden), -1)
-decoder_hidden = decoder_hidden[0].view(small_n_layers, small_batch_size, 2*small_hidden_size),                  decoder_hidden[1].view(small_n_layers, small_batch_size, 2*small_hidden_size)
-print(decoder_hidden[0].size())
-
-all_decoder_outputs = Variable(torch.zeros(max_target_length, small_batch_size, decoder_test.output_size))
-
-if USE_CUDA:
-    all_decoder_outputs = all_decoder_outputs.cuda()
-    decoder_input = decoder_input.cuda()
-
-# Run through decoder one time step at a time
-for t in range(max_target_length):
-    decoder_output, context, decoder_hidden, decoder_attn = decoder_test(
-        decoder_input, decoder_hidden, encoder_outputs
-    )
-    all_decoder_outputs[t] = decoder_output # Store this step's outputs
-    decoder_input = target_batches[t] # Next input is current target
-
-# Test masked cross entropy loss
-loss = masked_cross_entropy(
-    all_decoder_outputs.transpose(0, 1).contiguous(),
-    target_batches.transpose(0, 1).contiguous(),
-    target_lengths
-)
-print('loss', loss.data.item())
-
-
 # # Parameters & Config
 # 
 
-# In[64]:
+# In[35]:
 
 
 # Parameters
 
 attn_model = 'concat'
-encoder_hidden_size = 256
+encoder_hidden_size = 200
 decoder_hidden_size = 2*encoder_hidden_size
 n_layers = 2
 dropout = 0.1
-batch_size = 5
+batch_size = 8
 
 # Configure training/optimization
 clip = 50.0
 teacher_forcing_ratio = 0.5
 learning_rate = 0.0001
 decoder_learning_ratio = 5.0
-n_epochs = 10
+n_epochs = 50
 epoch = 0
-plot_every = 2
+plot_every = 10
 print_every = 5
-evaluate_every = 2
+evaluate_every = 10
 
 # Initialize models
-encoder = EncoderRNN(input_lang.n_words, encoder_hidden_size, n_layers, dropout=dropout,  bidirectional=True)
-decoder = AttnDecoderRNN(attn_model, decoder_hidden_size, output_lang.n_words, n_layers, dropout=dropout)
+encoder = EncoderRNN(input_lang.n_words, encoder_hidden_size, embeddings_matrix, n_layers,
+                     dropout=dropout,  bidirectional=True)
+decoder = AttnDecoderRNN(attn_model, decoder_hidden_size, output_lang.n_words,
+                         embeddings_matrix, n_layers, dropout=dropout)
 
 # Initialize optimizers and criterion
 encoder_optimizer = optim.Adam(encoder.parameters(), lr=learning_rate)
@@ -624,7 +617,7 @@ print_loss_total = 0 # Reset every print_every
 plot_loss_total = 0 # Reset every plot_every
 
 
-# In[65]:
+# In[36]:
 
 
 def train(input_batches, input_lengths, target_batches, target_lengths, encoder, decoder, encoder_optimizer, decoder_optimizer, criterion, n_layers=1, max_length=MAX_LENGTH):
@@ -679,7 +672,7 @@ def train(input_batches, input_lengths, target_batches, target_lengths, encoder,
     return loss.data.item(), ec, dc
 
 
-# In[66]:
+# In[37]:
 
 
 def evaluate(input_seq, batch_size =1, max_length=MAX_LENGTH):
@@ -726,7 +719,6 @@ def evaluate(input_seq, batch_size =1, max_length=MAX_LENGTH):
             decoded_words.append('<EOS>')
             break
         else:
-            print("NI ", ni)
             decoded_words.append(output_lang.index2word[ni])
             
         # Next input is chosen word
@@ -740,7 +732,7 @@ def evaluate(input_seq, batch_size =1, max_length=MAX_LENGTH):
     return decoded_words, decoder_attentions[:di+1, :len(encoder_outputs)]
 
 
-# In[67]:
+# In[38]:
 
 
 def evaluate_randomly():
@@ -748,7 +740,7 @@ def evaluate_randomly():
     evaluate_and_show_attention(input_sentence, target_sentence)
 
 
-# In[68]:
+# In[39]:
 
 
 import io
@@ -765,7 +757,7 @@ def show_plot_visdom():
     vis.image(torchvision.transforms.ToTensor()(Image.open(buf)), win=attn_win, opts={'title': attn_win})
 
 
-# In[69]:
+# In[40]:
 
 
 def show_attention(input_sentence, output_words, attentions):
@@ -788,7 +780,7 @@ def show_attention(input_sentence, output_words, attentions):
     plt.close()
 
 
-# In[70]:
+# In[32]:
 
 
 def evaluate_and_show_attention(input_sentence, target_sentence=None):
@@ -807,13 +799,13 @@ def evaluate_and_show_attention(input_sentence, target_sentence=None):
     vis.text(text, win=win, opts={'title': win})
 
 
-# In[71]:
+# In[ ]:
 
 
 evaluate_randomly()
 
 
-# In[ ]:
+# In[41]:
 
 
 ecs = []
@@ -866,7 +858,7 @@ while epoch < n_epochs:
         dca = 0
 
 
-# In[ ]:
+# In[42]:
 
 
 def show_plot(points):
@@ -879,10 +871,10 @@ def show_plot(points):
 show_plot(plot_losses)
 
 
-# In[ ]:
+# In[44]:
 
 
-example = "I am a tourist from india in us.i am diabitic.what type of us food can be suitable for me.?"
+example = "i am a tourist from india in us.i am diabitic.what type of us food can be suitable for me.?"
 output_words, attentions = evaluate(example)
 plt.matshow(attentions.numpy())
 show_plot_visdom()
